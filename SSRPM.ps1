@@ -553,7 +553,7 @@ function Invoke-MsSqlCommand {
                 }
 
                 # Output data
-                New-Object -TypeName PSObject -Property $hash_table
+                [PSCustomObject]$hash_table
             }
 
         }
@@ -582,7 +582,7 @@ function Invoke-MsSqlCommand {
                 $hash_table[$column_names[$i]] = ''
             }
 
-            $result = New-Object -TypeName PSObject -Property $hash_table
+            $result = [PSCustomObject]$hash_table
 
             # Read data
             while ($data_reader.Read()) {
@@ -619,7 +619,7 @@ function Invoke-MsSqlCommand {
             }
 
             # Output data
-            New-Object -TypeName PSObject -Property $hash_table
+            [PSCustomObject]$hash_table
         }
 
         $data_reader.Close()
