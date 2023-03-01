@@ -241,10 +241,10 @@ function Idm-Dispatcher {
                         }
                     }
                     else {
-                        [ordered]@{
+                        <#[ordered]@{
                             Class = $object.full_name
                             Operation = 'Create'
-                        }
+                        }#>
 
                         [ordered]@{
                             Class = $object.full_name
@@ -256,6 +256,7 @@ function Idm-Dispatcher {
 
                         if ($primary_keys) {
                             # Only supported if primary keys are present
+                            <#
                             [ordered]@{
                                 Class = $object.full_name
                                 Operation = 'Update'
@@ -264,7 +265,7 @@ function Idm-Dispatcher {
                             [ordered]@{
                                 Class = $object.full_name
                                 Operation = 'Delete'
-                            }
+                            }#>
                         }
                     }
                 }
