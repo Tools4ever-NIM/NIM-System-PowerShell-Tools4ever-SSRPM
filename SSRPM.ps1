@@ -115,87 +115,36 @@ function Idm-OnUnload {
 $ColumnsInfoCache = @{}
 
 
-function Fill-SqlInfoCache {
+function Compose-SqlCommand-SelectColumnsInfo {
     param (
-        [switch] $Force
+        [string] $Table
     )
 
-    if (!$Force -and $Global:SqlInfoCache.Ts -and ((Get-Date) - $Global:SqlInfoCache.Ts).TotalMilliseconds -le [Int32]600000) {
-        return
-    }
-
-    # Refresh cache
-    $sql_command = New-MsSqlCommand "
-        SELECT
-            ss.name + '.[' + st.name + ']' AS full_object_name,
-            (CASE WHEN st.type = 'U' THEN 'Table' WHEN st.type = 'V' THEN 'View' ELSE 'Other' END) AS object_type,
-            sc.name AS column_name,
-            CAST(CASE WHEN pk.COLUMN_NAME IS NULL THEN 0 ELSE 1 END AS BIT) AS is_primary_key,
-            sc.is_identity,
-            sc.is_computed,
-            sc.is_nullable
-        FROM
-            sys.schemas AS ss
-            INNER JOIN (
-                SELECT
-                    name, object_id, schema_id, type
-                FROM
-                    sys.tables
-                UNION ALL
-                SELECT
-                    name, object_id, schema_id, type
-                FROM
-                    sys.views
-            ) AS st ON ss.schema_id = st.schema_id
-            INNER JOIN sys.columns AS sc ON st.object_id = sc.object_id
-            LEFT JOIN (
-                SELECT
-                    CCU.*
-                FROM
-                    INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE AS CCU
-                    INNER JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS TC ON CCU.CONSTRAINT_NAME = TC.CONSTRAINT_NAME
-                WHERE
-                    TC.CONSTRAINT_TYPE = 'PRIMARY KEY'
-            ) AS pk ON ss.name = pk.TABLE_SCHEMA AND st.name = pk.TABLE_NAME AND sc.name = pk.COLUMN_NAME
-        ORDER BY
-            full_object_name, sc.column_id
     "
-
-    $objects = New-Object System.Collections.ArrayList
-    $object = @{}
-
-    # Process in one pass
-    Invoke-MsSqlCommand $sql_command | ForEach-Object {
-        if ($_.full_object_name -ne $object.full_name) {
-            if ($object.full_name -ne $null) {
-                $objects.Add($object) | Out-Null
-            }
-
-            $object = @{
-                full_name = $_.full_object_name
-                type      = $_.object_type
-                columns   = New-Object System.Collections.ArrayList
-            }
-        }
-
-        $object.columns.Add(@{
-            name           = $_.column_name
-            is_primary_key = $_.is_primary_key
-            is_identity    = $_.is_identity
-            is_computed    = $_.is_computed
-            is_nullable    = $_.is_nullable
-        }) | Out-Null
-    }
-
-    if ($object.full_name -ne $null) {
-        $objects.Add($object) | Out-Null
-    }
-
-    Dispose-MsSqlCommand $sql_command
-
-    $Global:SqlInfoCache.Objects = $objects
-    $Global:SqlInfoCache.Ts = Get-Date
+        SELECT
+    	    sc.name AS column_name,
+    	    CAST(CASE WHEN pk.COLUMN_NAME IS NULL THEN 0 ELSE 1 END AS BIT) AS is_primary_key,
+    	    sc.is_identity,
+    	    sc.is_computed,
+    	    sc.is_nullable
+        FROM
+        	sys.schemas AS ss
+    	    INNER JOIN sys.tables  AS st ON ss.schema_id = st.schema_id
+    	    INNER JOIN sys.columns AS sc ON st.object_id = sc.object_id
+    	    LEFT JOIN (
+        		SELECT
+    			    CCU.*
+    		    FROM
+        			INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE AS CCU
+    			    INNER JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS TC ON CCU.CONSTRAINT_NAME = TC.CONSTRAINT_NAME
+    		    WHERE
+        			TC.CONSTRAINT_TYPE = 'PRIMARY KEY'
+    	    ) AS pk ON ss.name = pk.TABLE_SCHEMA AND st.name = pk.TABLE_NAME AND sc.name = pk.COLUMN_NAME
+        WHERE
+        	ss.name + '.' + st.name = '$($Table -replace '\[|\]', '')'
+    "
 }
+
 
 function Idm-Dispatcher {
     param (
@@ -220,53 +169,61 @@ function Idm-Dispatcher {
 
             Open-MsSqlConnection $SystemParams
 
-            Fill-SqlInfoCache -Force
+            $tables = Invoke-MsSqlCommand "
+                SELECT
+                    TABLE_SCHEMA + '.[' + TABLE_NAME + ']' AS [Name],
+                    (CASE WHEN TABLE_TYPE = 'BASE TABLE' THEN 'Table' WHEN TABLE_TYPE = 'VIEW' THEN 'View' ELSE 'Unknown' END) AS [Type]
+                FROM
+                    INFORMATION_SCHEMA.TABLES
+                ORDER BY
+                    [Name]
+            "
 
             #
             # Output list of supported operations per table/view (named Class)
             #
 
             @(
-                foreach ($object in $Global:SqlInfoCache.Objects) {
-                    $primary_keys = $object.columns | Where-Object { $_.is_primary_key } | ForEach-Object { $_.name }
+                foreach ($t in $tables) {
+                    $columns = Invoke-MsSqlCommand (Compose-SqlCommand-SelectColumnsInfo $t.Name)
+                    $primary_key = @($columns | Where-Object { $_.is_primary_key } | ForEach-Object { $_.column_name })[0]
 
-                    if ($object.type -ne 'Table') {
+                    if ($t.Type -ne 'Table') {
                         # Non-tables only support 'Read'
                         [ordered]@{
-                            Class = $object.full_name
+                            Class = $t.Name
                             Operation = 'Read'
-                            'Source type' = $object.type
-                            'Primary key' = $primary_keys -join ', '
+                            'Source type' = $t.Type
+                            'Primary key' = $primary_key
                             'Supported operations' = 'R'
                         }
                     }
                     else {
                         <#[ordered]@{
-                            Class = $object.full_name
+                            Class = $t.Name
                             Operation = 'Create'
                         }#>
 
                         [ordered]@{
-                            Class = $object.full_name
+                            Class = $t.Name
                             Operation = 'Read'
-                            'Source type' = $object.type
-                            'Primary key' = $primary_keys -join ', '
-                            'Supported operations' = "CR$(if ($primary_keys) { 'UD' } else { '' })"
+                            'Source type' = $t.Type
+                            'Primary key' = $primary_key
+                            'Supported operations' = "CR$(if ($primary_key) { 'UD' } else { '' })"
                         }
 
-                        if ($primary_keys) {
-                            # Only supported if primary keys are present
-                            <#
+                        <#if ($primary_key) {
+                            # Only supported if primary key is present
                             [ordered]@{
-                                Class = $object.full_name
+                                Class = $t.Name
                                 Operation = 'Update'
                             }
 
                             [ordered]@{
-                                Class = $object.full_name
+                                Class = $t.Name
                                 Operation = 'Delete'
-                            }#>
-                        }
+                            }
+                        }#>
                     }
                 }
             )
@@ -286,9 +243,7 @@ function Idm-Dispatcher {
 
             Open-MsSqlConnection $SystemParams
 
-            Fill-SqlInfoCache
-
-            $columns = ($Global:SqlInfoCache.Objects | Where-Object { $_.full_name -eq $Class }).columns
+            $columns = Invoke-MsSqlCommand (Compose-SqlCommand-SelectColumnsInfo $Class)
 
             switch ($Operation) {
                 'Create' {
@@ -297,7 +252,7 @@ function Idm-Dispatcher {
                         parameters = @(
                             $columns | ForEach-Object {
                                 @{
-                                    name = $_.name;
+                                    name = $_.column_name;
                                     allowance = if ($_.is_identity -or $_.is_computed) { 'prohibited' } elseif (! $_.is_nullable) { 'mandatory' } else { 'optional' }
                                 }
                             }
@@ -323,10 +278,10 @@ function Idm-Dispatcher {
                             table = @{
                                 rows = @($columns | ForEach-Object {
                                     @{
-                                        name = $_.name
+                                        name = $_.column_name
                                         config = @(
                                             if ($_.is_primary_key) { 'Primary key' }
-                                            if ($_.is_identity)    { 'Generated' }
+                                            if ($_.is_identity)    { 'Auto identity' }
                                             if ($_.is_computed)    { 'Computed' }
                                             if ($_.is_nullable)    { 'Nullable' }
                                         ) -join ' | '
@@ -349,7 +304,7 @@ function Idm-Dispatcher {
                                     )
                                 }
                             }
-                            value = @($columns | ForEach-Object { $_.name })
+                            value = @($columns | ForEach-Object { $_.column_name })
                         }
                     )
                     break
@@ -361,13 +316,9 @@ function Idm-Dispatcher {
                         parameters = @(
                             $columns | ForEach-Object {
                                 @{
-                                    name = $_.name;
+                                    name = $_.column_name;
                                     allowance = if ($_.is_primary_key) { 'mandatory' } else { 'optional' }
                                 }
-                            }
-                            @{
-                                name = '*'
-                                allowance = 'prohibited'
                             }
                         )
                     }
@@ -381,7 +332,7 @@ function Idm-Dispatcher {
                             $columns | ForEach-Object {
                                 if ($_.is_primary_key) {
                                     @{
-                                        name = $_.name
+                                        name = $_.column_name
                                         allowance = 'mandatory'
                                     }
                                 }
@@ -405,123 +356,72 @@ function Idm-Dispatcher {
             Open-MsSqlConnection $SystemParams
 
             if (! $Global:ColumnsInfoCache[$Class]) {
-                Fill-SqlInfoCache
-
-                $columns = ($Global:SqlInfoCache.Objects | Where-Object { $_.full_name -eq $Class }).columns
+                $columns = Invoke-MsSqlCommand (Compose-SqlCommand-SelectColumnsInfo $Class)
 
                 $Global:ColumnsInfoCache[$Class] = @{
-                    primary_keys = @($columns | Where-Object { $_.is_primary_key } | ForEach-Object { $_.name })
-                    identity_col = @($columns | Where-Object { $_.is_identity    } | ForEach-Object { $_.name })[0]
+                    primary_key  = @($columns | Where-Object { $_.is_primary_key } | ForEach-Object { $_.column_name })[0]
+                    identity_col = @($columns | Where-Object { $_.is_identity    } | ForEach-Object { $_.column_name })[0]
                 }
             }
 
-            $primary_keys = $Global:ColumnsInfoCache[$Class].primary_keys
+            $primary_key  = $Global:ColumnsInfoCache[$Class].primary_key
             $identity_col = $Global:ColumnsInfoCache[$Class].identity_col
 
             $function_params = ConvertFrom-Json2 $FunctionParams
 
-            # Replace $null by [System.DBNull]::Value
-            $keys_with_null_value = @()
-            foreach ($key in $function_params.Keys) { if ($function_params[$key] -eq $null) { $keys_with_null_value += $key } }
-            foreach ($key in $keys_with_null_value) { $function_params[$key] = [System.DBNull]::Value }
-
-            $sql_command = New-MsSqlCommand
+            $command = $null
 
             $projection = if ($function_params['selected_columns'].count -eq 0) { '*' } else { @($function_params['selected_columns'] | ForEach-Object { "[$_]" }) -join ', ' }
 
             switch ($Operation) {
                 'Create' {
-                    $filter = if ($identity_col) {
-                                  "[$identity_col] = SCOPE_IDENTITY()"
-                              }
-                              elseif ($primary_keys) {
-                                  @($primary_keys | ForEach-Object { "[$_] = $(AddParam-MsSqlCommand $sql_command $function_params[$_])" }) -join ' AND '
-                              }
-                              else {
-                                  @($function_params.Keys | ForEach-Object { "[$_] = $(AddParam-MsSqlCommand $sql_command $function_params[$_])" }) -join ' AND '
-                              }
+                    $selection = if ($identity_col) {
+                                     "[$identity_col] = SCOPE_IDENTITY()"
+                                 }
+                                 elseif ($primary_key) {
+                                     "[$primary_key] = '$($function_params[$primary_key])'"
+                                 }
+                                 else {
+                                     @($function_params.Keys | ForEach-Object { "[$_] = '$($function_params[$_])'" }) -join ' AND '
+                                 }
 
-                    $sql_command.CommandText = "
-                        INSERT INTO $Class (
-                            $(@($function_params.Keys | ForEach-Object { "[$_]" }) -join ', ')
-                        )
-                        VALUES (
-                            $(@($function_params.Keys | ForEach-Object { AddParam-MsSqlCommand $sql_command $function_params[$_] }) -join ', ')
-                        );
-                        SELECT TOP(1)
-                            $projection
-                        FROM
-                            $Class
-                        WHERE
-                            $filter
-                    "
+                    $command = "INSERT INTO $Class ($(@($function_params.Keys | ForEach-Object { "[$_]" }) -join ', ')) VALUES ($(@($function_params.Keys | ForEach-Object { "$(if ($function_params[$_] -ne $null) { "'$($function_params[$_])'" } else { 'null' })" }) -join ', ')); SELECT TOP(1) $projection FROM $Class WHERE $selection"
                     break
                 }
 
                 'Read' {
-                    $filter = if ($function_params['where_clause'].length -eq 0) { '' } else { " WHERE $($function_params['where_clause'])" }
+                    $selection = if ($function_params['where_clause'].length -eq 0) { '' } else { " WHERE $($function_params['where_clause'])" }
 
-                    $sql_command.CommandText = "
-                        SELECT
-                            $projection
-                        FROM
-                            $Class$filter
-                    "
+                    $command = "SELECT $projection FROM $Class$selection"
                     break
                 }
 
                 'Update' {
-                    $filter = @($primary_keys | ForEach-Object { "[$_] = $(AddParam-MsSqlCommand $sql_command $function_params[$_])" }) -join ' AND '
-
-                    $sql_command.CommandText = "
-                        UPDATE TOP(1)
-                            $Class
-                        SET
-                            $(@($function_params.Keys | ForEach-Object { if ($_ -notin $primary_keys) { "[$_] = $(AddParam-MsSqlCommand $sql_command $function_params[$_])" } }) -join ', ')
-                        WHERE
-                            $filter;
-                        SELECT TOP(1)
-                            $(@($function_params.Keys | ForEach-Object { "[$_]" }) -join ', ')
-                        FROM
-                            $Class
-                        WHERE
-                            $filter
-                    "
+                    $command = "UPDATE TOP(1) $Class SET $(@($function_params.Keys | ForEach-Object { if ($_ -ne $primary_key) { "[$_] = $(if ($function_params[$_] -ne $null) { "'$($function_params[$_])'" } else { 'null' })" } }) -join ', ') WHERE [$primary_key] = '$($function_params[$primary_key])'; SELECT TOP(1) [$primary_key], $(@($function_params.Keys | ForEach-Object { if ($_ -ne $primary_key) { "[$_]" } }) -join ', ') FROM $Class WHERE [$primary_key] = '$($function_params[$primary_key])'"
                     break
                 }
 
                 'Delete' {
-                    $filter = @($primary_keys | ForEach-Object { "[$_] = $(AddParam-MsSqlCommand $sql_command $function_params[$_])" }) -join ' AND '
-
-                    $sql_command.CommandText = "
-                        DELETE TOP(1)
-                            $Class
-                        WHERE
-                            $filter
-                    "
+                    $command = "DELETE TOP(1) $Class WHERE [$primary_key] = '$($function_params[$primary_key])'"
                     break
                 }
             }
 
-            if ($sql_command.CommandText) {
-                $deparam_command = DeParam-MsSqlCommand $sql_command
-
-                LogIO info ($deparam_command -split ' ')[0] -In -Command $deparam_command
+            if ($command) {
+                LogIO info ($command -split ' ')[0] -In -Command $command
 
                 if ($Operation -eq 'Read') {
                     # Streamed output
-                    Invoke-MsSqlCommand $sql_command $deparam_command
+                    Invoke-MsSqlCommand $command
                 }
                 else {
                     # Log output
-                    $rv = Invoke-MsSqlCommand $sql_command $deparam_command | ForEach-Object { $_ }
-                    LogIO info ($deparam_command -split ' ')[0] -Out $rv
+                    $rv = Invoke-MsSqlCommand $command
+                    LogIO info ($command -split ' ')[0] -Out $rv
 
                     $rv
                 }
             }
-
-            Dispose-MsSqlCommand $sql_command
 
         }
 
@@ -625,96 +525,21 @@ function Idm-dbo_OnBoardingUsersCreate {
 #
 # Helper functions
 #
-function New-MsSqlCommand {
-    param (
-        [string] $CommandText
-    )
-
-    New-Object System.Data.SqlClient.SqlCommand($CommandText, $Global:MsSqlConnection)
-}
-
-
-function Dispose-MsSqlCommand {
-    param (
-        [System.Data.SqlClient.SqlCommand] $SqlCommand
-    )
-
-    $SqlCommand.Dispose()
-}
-function AddParam-MsSqlCommand {
-    param (
-        [System.Data.SqlClient.SqlCommand] $SqlCommand,
-        $Param
-    )
-
-    $param_name = "@param$($SqlCommand.Parameters.Count)_"
-    $param_value = if ($Param -isnot [system.array]) { $Param } else { $Param | ConvertTo-Json -Compress -Depth 32 }
-
-    $SqlCommand.Parameters.AddWithValue($param_name, $param_value) | Out-Null
-
-    return $param_name
-}
-
-
-function DeParam-MsSqlCommand {
-    param (
-        [System.Data.SqlClient.SqlCommand] $SqlCommand
-    )
-
-    $deparam_command = $SqlCommand.CommandText
-
-    foreach ($p in $SqlCommand.Parameters) {
-        $value_txt = 
-            if ($p.Value -eq [System.DBNull]::Value) {
-                'NULL'
-            }
-            else {
-                switch ($p.SqlDbType) {
-                    { $_ -in @(
-                        [System.Data.SqlDbType]::Char
-                        [System.Data.SqlDbType]::Date
-                        [System.Data.SqlDbType]::DateTime
-                        [System.Data.SqlDbType]::DateTime2
-                        [System.Data.SqlDbType]::DateTimeOffset
-                        [System.Data.SqlDbType]::NChar
-                        [System.Data.SqlDbType]::NText
-                        [System.Data.SqlDbType]::NVarChar
-                        [System.Data.SqlDbType]::Text
-                        [System.Data.SqlDbType]::Time
-                        [System.Data.SqlDbType]::VarChar
-                        [System.Data.SqlDbType]::Xml
-                    )} {
-                        "'" + $p.Value.ToString().Replace("'", "''") + "'"
-                        break
-                    }
-        
-                    default {
-                        $p.Value.ToString().Replace("'", "''")
-                        break
-                    }
-                }
-            }
-
-        $deparam_command = $deparam_command.Replace($p.ParameterName, $value_txt)
-    }
-
-    # Make one single line
-    @($deparam_command -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }) -join ' '
-}
 
 function Invoke-MsSqlCommand {
     param (
-        [System.Data.SqlClient.SqlCommand] $SqlCommand,
-        [string] $DeParamCommand
+        [string] $Command
     )
 
     # Streaming
+    # ERAM dbo.Files (426.977 rows) execution time: ?
     function Invoke-MsSqlCommand-ExecuteReader {
         param (
-            [System.Data.SqlClient.SqlCommand] $SqlCommand
+            [string] $Command
         )
 
-        $data_reader = $SqlCommand.ExecuteReader()
+        $sql_command = New-Object System.Data.SqlClient.SqlCommand($Command, $Global:MsSqlConnection)
+        $data_reader = $sql_command.ExecuteReader()
         $column_names = @($data_reader.GetSchemaTable().ColumnName)
 
         if ($column_names) {
@@ -725,6 +550,7 @@ function Invoke-MsSqlCommand {
                 $hash_table[$column_name] = ""
             }
 
+#           $obj = [PSCustomObject]$hash_table
             $obj = New-Object -TypeName PSObject -Property $hash_table
 
             # Read data
@@ -740,15 +566,18 @@ function Invoke-MsSqlCommand {
         }
 
         $data_reader.Close()
+        $sql_command.Dispose()
     }
 
     # Streaming
+    # ERAM dbo.Files (426.977 rows) execution time: 16.7 s
     function Invoke-MsSqlCommand-ExecuteReader00 {
         param (
-            [System.Data.SqlClient.SqlCommand] $SqlCommand
+            [string] $Command
         )
 
-        $data_reader = $SqlCommand.ExecuteReader()
+        $sql_command = New-Object System.Data.SqlClient.SqlCommand($Command, $Global:MsSqlConnection)
+        $data_reader = $sql_command.ExecuteReader()
         $column_names = @($data_reader.GetSchemaTable().ColumnName)
 
         if ($column_names) {
@@ -760,7 +589,7 @@ function Invoke-MsSqlCommand {
                 $hash_table[$column_names[$i]] = ''
             }
 
-            $result = New-Object -TypeName PSObject -Property $hash_table
+            $result = [PSCustomObject]$hash_table
 
             # Read data
             while ($data_reader.Read()) {
@@ -775,15 +604,18 @@ function Invoke-MsSqlCommand {
         }
 
         $data_reader.Close()
+        $sql_command.Dispose()
     }
 
     # Streaming
+    # ERAM dbo.Files (426.977 rows) execution time: 01:11.9 s
     function Invoke-MsSqlCommand-ExecuteReader01 {
         param (
-            [System.Data.SqlClient.SqlCommand] $SqlCommand
+            [string] $Command
         )
 
-        $data_reader = $SqlCommand.ExecuteReader()
+        $sql_command = New-Object System.Data.SqlClient.SqlCommand($Command, $Global:MsSqlConnection)
+        $data_reader = $sql_command.ExecuteReader()
         $field_count = $data_reader.FieldCount
 
         while ($data_reader.Read()) {
@@ -794,19 +626,22 @@ function Invoke-MsSqlCommand {
             }
 
             # Output data
-            New-Object -TypeName PSObject -Property $hash_table
+            [PSCustomObject]$hash_table
         }
 
         $data_reader.Close()
+        $sql_command.Dispose()
     }
 
     # Non-streaming (data stored in $data_table)
+    # ERAM dbo.Files (426.977 rows) execution time: 15.5 s
     function Invoke-MsSqlCommand-DataAdapter-DataTable {
         param (
-            [System.Data.SqlClient.SqlCommand] $SqlCommand
+            [string] $Command
         )
 
-        $data_adapter = New-Object System.Data.SqlClient.SqlDataAdapter($SqlCommand)
+        $sql_command  = New-Object System.Data.SqlClient.SqlCommand($Command, $Global:MsSqlConnection)
+        $data_adapter = New-Object System.Data.SqlClient.SqlDataAdapter($sql_command)
         $data_table   = New-Object System.Data.DataTable
         $data_adapter.Fill($data_table) | Out-Null
 
@@ -815,15 +650,18 @@ function Invoke-MsSqlCommand {
 
         $data_table.Dispose()
         $data_adapter.Dispose()
+        $sql_command.Dispose()
     }
 
     # Non-streaming (data stored in $data_set)
+    # ERAM dbo.Files (426.977 rows) execution time: 14.8 s
     function Invoke-MsSqlCommand-DataAdapter-DataSet {
         param (
-            [System.Data.SqlClient.SqlCommand] $SqlCommand
+            [string] $Command
         )
 
-        $data_adapter = New-Object System.Data.SqlClient.SqlDataAdapter($SqlCommand)
+        $sql_command  = New-Object System.Data.SqlClient.SqlCommand($Command, $Global:MsSqlConnection)
+        $data_adapter = New-Object System.Data.SqlClient.SqlDataAdapter($sql_command)
         $data_set     = New-Object System.Data.DataSet
         $data_adapter.Fill($data_set) | Out-Null
 
@@ -832,23 +670,20 @@ function Invoke-MsSqlCommand {
 
         $data_set.Dispose()
         $data_adapter.Dispose()
+        $sql_command.Dispose()
     }
 
-    if (! $DeParamCommand) {
-        $DeParamCommand = DeParam-MsSqlCommand $SqlCommand
-    }
+    $Command = ($Command -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }) -join ' '
 
-    Log debug $DeParamCommand
+    Log debug $Command
 
     try {
-        Invoke-MsSqlCommand-ExecuteReader $SqlCommand
+        Invoke-MsSqlCommand-ExecuteReader $Command
     }
     catch {
         Log error "Failed: $_"
         Write-Error $_
     }
-
-    Log debug "Done"
 }
 
 
@@ -899,7 +734,6 @@ function Open-MsSqlConnection {
             $Global:MsSqlConnectionString = $connection_string
 
             $Global:ColumnsInfoCache = @{}
-            $Global:SqlInfoCache = @{}
         }
         catch {
             Log error "Failed: $_"
