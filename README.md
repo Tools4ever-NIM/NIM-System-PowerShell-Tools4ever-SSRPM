@@ -1,12 +1,13 @@
-# NIM-Conn-System-PowerShell-Tools4ever-SSRPM
-<p align="center">
-  <a href="https://www.tools4ever.com"><img src="https://www.tools4ever.com/wp-content/uploads/2020/07/T4E2020-tagline.svg"></a>
-  <a href="https://www.tools4ever.com/software/self-service-reset-password-management/"><img src="https://2n3o0o1hkd9u2g92563kh63s-wpengine.netdna-ssl.com/wp-content/uploads/2020/10/logo_ssrpm.svg"></a>
-</p>
+# Tools4ever SSRPM
+<img src="https://github.com/Tools4ever-NIM/NIM-System-PowerShell-Tools4ever-SSRPM/assets/24281600/c95c8826-48b7-4d9a-bebd-a3f0c275d19d" width="256px" />
 
-- Pulls data from SQL Database
-- Call API to onboard user
 
+## Data Tables
+- This is open ended. You can select any table from the SSRPM database
+
+## Actions
+- Onboarding
+    - Add
 
 # NIM Docs
 The official NIM documentation can be found at: https://docs.nimsuite.com
