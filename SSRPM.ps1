@@ -75,19 +75,72 @@ function Idm-SystemInfo {
                 label = 'API Token'
                 value = ''
             }
+			@{
+                name = 'onboarding_api_timeout'
+                type = 'textbox'
+                label = 'Timeout for API Request (seconds)'
+                description = ''
+                value = 60
+            }
+			@{
+                name = 'use_proxy'
+                type = 'checkbox'
+                label = 'Use Proxy'
+                description = 'Use Proxy server for request'
+                value = $false                  # Default value of checkbox item
+            }
+			@{
+                name = 'proxy_address'
+                type = 'textbox'
+                label = 'Proxy Address'
+                description = 'Address of the proxy server'
+                value = 'http://127.0.0.1:8888'
+                disabled = '!use_proxy'
+                hidden = '!use_proxy'
+            }
+            @{
+                name = 'use_proxy_credentials'
+                type = 'checkbox'
+                label = 'Use Proxy Credentials'
+                description = 'Use Proxy server for requets'
+                value = $false
+                disabled = '!use_proxy'
+                hidden = '!use_proxy'
+            }
+            @{
+                name = 'proxy_username'
+                type = 'textbox'
+                label = 'Proxy Username'
+                label_indent = $true
+                description = 'Username account'
+                value = ''
+                disabled = '!use_proxy_credentials'
+                hidden = '!use_proxy_credentials'
+            }
+            @{
+                name = 'proxy_password'
+                type = 'textbox'
+                password = $true
+                label = 'Proxy Password'
+                label_indent = $true
+                description = 'User account password'
+                value = ''
+                disabled = '!use_proxy_credentials'
+                hidden = '!use_proxy_credentials'
+            }
             @{
                 name = 'nr_of_sessions'
                 type = 'textbox'
                 label = 'Max. number of simultaneous sessions'
                 description = ''
-                value = 5
+                value = 1
             }
             @{
                 name = 'sessions_idle_timeout'
                 type = 'textbox'
                 label = 'Session cleanup idle time (minutes)'
                 description = ''
-                value = 30
+                value = 1
             }
         )
     }
@@ -600,23 +653,46 @@ function Idm-dbo_OnBoardingUsersCreate {
             $uri = "$($connection_params.url)/onboarding/import"
 
             Log info "REST - POST - $($uri)"
-            $response = Invoke-WebRequest -Uri $uri -Method POST -ContentType "application/json" -Body ($account | ConvertTo-Json -Depth 10) -UseBasicParsing
+			
+		if($SystemParams.use_proxy)
+        {
+            Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint srvPoint, X509Certificate certificate,
+        WebRequest request, int certificateProblem) {
+        return true;
+    }
+}
+"@
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+            $splat["Proxy"] = $SystemParams.proxy_address
+
+            if($SystemParams.use_proxy_credentials)
+            {
+                $splat["proxyCredential"] = New-Object System.Management.Automation.PSCredential ($SystemParams.proxy_username, (ConvertTo-SecureString $SystemParams.proxy_password -AsPlainText -Force) )
+            }
+        }
+            $response = Invoke-WebRequest -Uri $uri -Method POST -ContentType "application/json" -Body ($account | ConvertTo-Json -Depth 10) -UseBasicParsing -Timeout $SystemParams.onboarding_api_timeout
             
             if(($response | ConvertFrom-Json).Success)
             {
-                $rv = $false
                 LogIO info "dbo_OnBoardingUsersCreate" -Out "Sucessfully Onboarded User"
             }
             else
             {
-                throw $response.Content
+                Log error "Failed: $_"
+				Write-Error $_
             }
                 
         }
         catch {
             Log error $_
-            LogIO error "dbo_OnBoardingUsersCreate" -Out $_
+            Write-Error $_
         }
+		
     }
     Log info "Done"
 }
