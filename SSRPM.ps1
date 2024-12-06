@@ -2,7 +2,7 @@
 
 # Put a comma-separated list of attribute names here, whose value should be masked before 
 # writing to log files. Examples are: 'Password','accountPassword'
-$Log_MaskableKeys = @()
+$Log_MaskableKeys = @("password","proxy_password")
 
 
 #
@@ -33,7 +33,7 @@ function Idm-SystemInfo {
                 name = 'database'
                 type = 'textbox'
                 label = 'Database'
-                description = 'Name of Microsoft SQL database'
+                description = 'Name of database'
                 value = 'SSRPM'
             }
             @{
@@ -270,15 +270,12 @@ function Idm-Dispatcher {
             #
             # Get all tables and views in database
             #
-
             Open-MsSqlConnection $SystemParams
-
             Fill-SqlInfoCache -Force
 
             #
             # Output list of supported operations per table/view (named Class)
             #
-
             @(
                 foreach ($object in $Global:SqlInfoCache.Objects) {
                     $primary_keys = $object.columns | Where-Object { $_.is_primary_key } | ForEach-Object { $_.name }
@@ -294,31 +291,12 @@ function Idm-Dispatcher {
                         }
                     }
                     else {
-                        <#[ordered]@{
-                            Class = $object.full_name
-                            Operation = 'Create'
-                        }#>
-
                         [ordered]@{
                             Class = $object.full_name
                             Operation = 'Read'
                             'Source type' = $object.type
                             'Primary key' = $primary_keys -join ', '
                             'Supported operations' = "CR$(if ($primary_keys) { 'UD' } else { '' })"
-                        }
-
-                        if ($primary_keys) {
-                            # Only supported if primary keys are present
-                            <#
-                            [ordered]@{
-                                Class = $object.full_name
-                                Operation = 'Update'
-                            }
-
-                            [ordered]@{
-                                Class = $object.full_name
-                                Operation = 'Delete'
-                            }#>
                         }
                     }
                 }
@@ -338,7 +316,6 @@ function Idm-Dispatcher {
             #
 
             Open-MsSqlConnection $SystemParams
-
             Fill-SqlInfoCache
 
             $columns = ($Global:SqlInfoCache.Objects | Where-Object { $_.full_name -eq $Class }).columns
@@ -648,13 +625,21 @@ function Idm-dbo_OnBoardingUsersCreate {
                             };
             )
         };
-        $rv = $true;
+		
         try {
             $uri = "$($connection_params.url)/onboarding/import"
 
             Log info "REST - POST - $($uri)"
 			
-		if($SystemParams.use_proxy)
+			$splat = @{
+				Uri = $Uri
+				Method = "POST"
+				ContentType = "application/json"
+				Body = ($account | ConvertTo-Json -Depth 10)
+				TimeoutSec =  ($connection_params.onboarding_api_timeout)
+			}
+			
+		if($connection_params.use_proxy)
         {
             Add-Type @"
 using System.Net;
@@ -667,15 +652,18 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     }
 }
 "@
-[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
-            $splat["Proxy"] = $SystemParams.proxy_address
 
-            if($SystemParams.use_proxy_credentials)
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+            $splat["Proxy"] = $connection_params.proxy_address
+
+            if($connection_params.use_proxy_credentials)
             {
-                $splat["proxyCredential"] = New-Object System.Management.Automation.PSCredential ($SystemParams.proxy_username, (ConvertTo-SecureString $SystemParams.proxy_password -AsPlainText -Force) )
+                $splat["proxyCredential"] = New-Object System.Management.Automation.PSCredential ($connection_params.proxy_username, (ConvertTo-SecureString $connection_params.proxy_password -AsPlainText -Force) )
             }
-        }
-            $response = Invoke-WebRequest -Uri $uri -Method POST -ContentType "application/json" -Body ($account | ConvertTo-Json -Depth 10) -UseBasicParsing -Timeout $SystemParams.onboarding_api_timeout
+			
+}
+
+            $response = Invoke-WebRequest @splat -UseBasicParsing
             
             if(($response | ConvertFrom-Json).Success)
             {
@@ -816,98 +804,6 @@ function Invoke-MsSqlCommand {
         }
 
         $data_reader.Close()
-    }
-
-    # Streaming
-    function Invoke-MsSqlCommand-ExecuteReader00 {
-        param (
-            [System.Data.SqlClient.SqlCommand] $SqlCommand
-        )
-
-        $data_reader = $SqlCommand.ExecuteReader()
-        $column_names = @($data_reader.GetSchemaTable().ColumnName)
-
-        if ($column_names) {
-
-            # Initialize result
-            $hash_table = [ordered]@{}
-
-            for ($i = 0; $i -lt $column_names.Count; $i++) {
-                $hash_table[$column_names[$i]] = ''
-            }
-
-            $result = New-Object -TypeName PSObject -Property $hash_table
-
-            # Read data
-            while ($data_reader.Read()) {
-                foreach ($column_name in $column_names) {
-                    $result.$column_name = $data_reader[$column_name]
-                }
-
-                # Output data
-                $result
-            }
-
-        }
-
-        $data_reader.Close()
-    }
-
-    # Streaming
-    function Invoke-MsSqlCommand-ExecuteReader01 {
-        param (
-            [System.Data.SqlClient.SqlCommand] $SqlCommand
-        )
-
-        $data_reader = $SqlCommand.ExecuteReader()
-        $field_count = $data_reader.FieldCount
-
-        while ($data_reader.Read()) {
-            $hash_table = [ordered]@{}
-        
-            for ($i = 0; $i -lt $field_count; $i++) {
-                $hash_table[$data_reader.GetName($i)] = $data_reader.GetValue($i)
-            }
-
-            # Output data
-            New-Object -TypeName PSObject -Property $hash_table
-        }
-
-        $data_reader.Close()
-    }
-
-    # Non-streaming (data stored in $data_table)
-    function Invoke-MsSqlCommand-DataAdapter-DataTable {
-        param (
-            [System.Data.SqlClient.SqlCommand] $SqlCommand
-        )
-
-        $data_adapter = New-Object System.Data.SqlClient.SqlDataAdapter($SqlCommand)
-        $data_table   = New-Object System.Data.DataTable
-        $data_adapter.Fill($data_table) | Out-Null
-
-        # Output data
-        $data_table.Rows
-
-        $data_table.Dispose()
-        $data_adapter.Dispose()
-    }
-
-    # Non-streaming (data stored in $data_set)
-    function Invoke-MsSqlCommand-DataAdapter-DataSet {
-        param (
-            [System.Data.SqlClient.SqlCommand] $SqlCommand
-        )
-
-        $data_adapter = New-Object System.Data.SqlClient.SqlDataAdapter($SqlCommand)
-        $data_set     = New-Object System.Data.DataSet
-        $data_adapter.Fill($data_set) | Out-Null
-
-        # Output data
-        $data_set.Tables[0]
-
-        $data_set.Dispose()
-        $data_adapter.Dispose()
     }
 
     if (! $DeParamCommand) {
